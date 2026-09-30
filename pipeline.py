@@ -129,6 +129,13 @@ def scope_key_for(task, target_date, as_of):
     return f"date={target_date.isoformat()}|asof={as_of.isoformat()}"
 
 
+def partition_key_for(task, target_date):
+    """The physical partition a task writes to: one shared partition for a
+    global task, one per date otherwise. Coarser than scope_key on purpose —
+    this is what pipeline_partition_scope is keyed on."""
+    return "global" if task in GLOBAL_TASKS else target_date.isoformat()
+
+
 def checkpoint_hash_for(task, target_date, as_of, upstream_hashes, code_hash):
     payload = {
         "task": task,
@@ -171,6 +178,32 @@ def upsert_checkpoint(conn, task, scope_key, checkpoint_hash, status):
             "scope_key": scope_key,
             "checkpoint_hash": checkpoint_hash,
             "status": status,
+            "updated_at": datetime.now(timezone.utc),
+        },
+    )
+
+
+def get_resident_as_of(conn, task, partition_key):
+    row = conn.execute(
+        "SELECT as_of FROM pipeline_partition_scope WHERE task = $task AND partition_key = $partition_key",
+        {"task": task, "partition_key": partition_key},
+    ).fetchone()
+    return None if row is None else row[0]
+
+
+def set_resident_as_of(conn, task, partition_key, as_of_text):
+    conn.execute(
+        """
+        INSERT INTO pipeline_partition_scope (task, partition_key, as_of, updated_at)
+        VALUES ($task, $partition_key, $as_of, $updated_at)
+        ON CONFLICT (task, partition_key) DO UPDATE SET
+            as_of = EXCLUDED.as_of,
+            updated_at = EXCLUDED.updated_at
+        """,
+        {
+            "task": task,
+            "partition_key": partition_key,
+            "as_of": as_of_text,
             "updated_at": datetime.now(timezone.utc),
         },
     )
@@ -279,12 +312,15 @@ def run_dag_for_date(conn, order, target_date, as_of, force, fail_task, code_has
                      None, f"blocked by upstream task '{blocking_parent}'")
             continue
 
+        partition_key = partition_key_for(task, target_date)
         checkpoint_hash = checkpoint_hash_for(task, target_date, as_of, hashes, code_hash)
         existing = get_checkpoint(conn, task, scope_key)
+        resident_as_of = get_resident_as_of(conn, task, partition_key)
         already_done = (
             existing is not None
             and existing["status"] == "success"
             and existing["checkpoint_hash"] == checkpoint_hash
+            and resident_as_of == as_of.isoformat()
         )
 
         if already_done and not force:
@@ -297,6 +333,7 @@ def run_dag_for_date(conn, order, target_date, as_of, force, fail_task, code_has
         try:
             execute_task(conn, task, target_date, as_of, fail_here=(fail_task == task))
             upsert_checkpoint(conn, task, scope_key, checkpoint_hash, "success")
+            set_resident_as_of(conn, task, partition_key, as_of.isoformat())
             conn.execute("COMMIT")
             outcome[task] = "success"
             hashes[task] = checkpoint_hash

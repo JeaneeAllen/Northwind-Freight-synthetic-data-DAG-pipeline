@@ -75,3 +75,19 @@ CREATE TABLE IF NOT EXISTS pipeline_checkpoints (
     updated_at TIMESTAMP,
     PRIMARY KEY (task, scope_key)
 );
+
+-- Tracks which --as-of cutoff is CURRENTLY resident in each task's physical
+-- partition (one row per date for a per-date task, one row total for a
+-- global task). Physical storage only ever holds one as-of per partition at
+-- a time (a partition replace overwrites it outright), but pipeline_checkpoints
+-- can accumulate a "success" row per (task, date, as-of) triple. Without this
+-- table, revisiting a date under an as-of that isn't the one currently loaded
+-- would find its own old checkpoint row still marked success and skip,
+-- silently serving data computed for a different cutoff.
+CREATE TABLE IF NOT EXISTS pipeline_partition_scope (
+    task VARCHAR,
+    partition_key VARCHAR,
+    as_of VARCHAR,
+    updated_at TIMESTAMP,
+    PRIMARY KEY (task, partition_key)
+);
