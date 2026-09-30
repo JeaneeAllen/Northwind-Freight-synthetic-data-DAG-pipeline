@@ -63,22 +63,20 @@ def main():
         tmp_root = Path(tmp)
 
         # --- Test 1: full 90-day run at cutoff March 31 -------------------
-        # Expected count: the assignment's checklist says 894 (= 900 - the
-        # 6 explicitly late-arriving shipments). That assumes only those 6
-        # cross the cutoff. In this data, normal (non-late) lane transit
-        # times of 1-3 days ALSO push shipments from the last few days of
-        # the quarter past a cutoff set to the quarter's last day: Mar 29
-        # loses 5 more, Mar 30 loses 7 more, Mar 31 loses all 10. 900 - 22
-        # = 878. See the written review for the full breakdown; this is a
-        # mismatch in the checklist's assumption, not a pipeline defect —
-        # raw.sql's filter (arrival_date <= as_of) is exactly per spec.
+        # arrival_date means "available for billing," not physical delivery:
+        # for an ordinary shipment it equals shipment_date, so only the 6
+        # deliberately-late shipments (2/day on Mar 29-31, +7 days) can ever
+        # cross a same-day cutoff. 900 - 6 = 894. (An earlier generator
+        # revision computed arrival_date from each lane's 1-3 day standard
+        # transit time, which let ordinary shipments from the last few days
+        # of the quarter cross the cutoff too, giving 878 instead — fixed.)
         ws1 = new_workspace(tmp_root, "t1_cutoff_mar31")
         r = run_pipeline(ws1, "backfill", "--start", "2026-01-01", "--end", "2026-03-31", "--as-of", "2026-03-31")
         n = query(ws1, "SELECT COUNT(DISTINCT shipment_id) FROM staging_shipments")[0][0]
         check(
-            "90-day run at cutoff 2026-03-31 has a stable, arithmetic-consistent unique count",
-            r.returncode == 0 and n == 878,
-            f"got {n} unique shipments (checklist assumed 894; correct value given this data's transit times is 878 — see review)",
+            "90-day run at cutoff 2026-03-31 contains 894 unique shipments",
+            r.returncode == 0 and n == 894,
+            f"got {n} unique shipments",
         )
 
         # --- Test 2 & 3: intermediate failure blocks mart/export, and the

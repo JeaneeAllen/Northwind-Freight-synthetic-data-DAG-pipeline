@@ -30,18 +30,22 @@ These are choices baked into the synthetic data and the pipeline's math — not
 things you can infer from the code alone, so they're written down here:
 
 - **Money is always integer cents**, never a float. `116565` means $1,165.65.
-- **3 static lanes**, each with a fixed distance, a fixed rate per mile, and a
-  fixed "normal" transit time (1, 2, or 3 days). Lanes never change once
-  generated.
+- **3 static lanes**, each with a fixed distance, rate per mile, and a
+  `standard_transit_days` field. That field is descriptive lane metadata only
+  — it does not feed `arrival_date` (see below) and is not used in any
+  revenue/cost/margin math. Lanes never change once generated.
 - **1 fuel surcharge rate per calendar date**, cents per mile, cycling 45–54¢/mi.
 - **9 exact duplicate shipment rows** are deliberately injected (same
   `shipment_id`, same everything) so the pipeline has something real to
   deduplicate. `staging_shipments` collapses them with `GROUP BY shipment_id`
   using `MIN()` on every column — safe here because duplicates are byte-identical,
   so `MIN()` can't accidentally pick a "wrong" version.
-- **6 shipments arrive 7 days late** (2 per day, on March 29, 30, and 31) instead
-  of following their lane's normal transit time. These exist to exercise the
-  `--as-of` cutoff logic (see below).
+- **`arrival_date` means "available for billing," not physical delivery.**
+  For an ordinary shipment, `arrival_date` equals `shipment_date`. **6
+  shipments** (2 per day, on March 29, 30, and 31) are deliberately late:
+  their `arrival_date` is `shipment_date + 7 days` instead. These exist to
+  exercise the `--as-of` cutoff logic (see below) — they're the *only*
+  shipments a cutoff on or before their shipment date can exclude.
 - **Cost has no real source in the data**, so `intermediate.sql` assumes a cost
   model explicitly: the fuel surcharge is a pure pass-through cost (no markup),
   and the freight charge carries an 80% cost ratio — i.e. a flat 20% margin on
@@ -57,26 +61,30 @@ get backwards:
   shipment that shipped on March 29 is *always* March 29's shipment, in every
   table, forever — the `mart`/`export` row for March 29 is about shipments
   that shipped that day, not shipments that arrived that day.
-- **`arrival_date` decides whether that shipment is visible yet, given a
-  cutoff.** `raw.sql` only loads a shipment if `arrival_date <= --as-of`. A
-  shipment can ship on March 29 and still be invisible to a March 31 cutoff,
-  if it hasn't arrived by then.
+- **`arrival_date` decides whether that shipment's bill is available yet,
+  given a cutoff.** `raw.sql` only loads a shipment if `arrival_date <=
+  --as-of`. `arrival_date` here means "available for billing," not physical
+  delivery: for an ordinary shipment it's simply equal to `shipment_date`, so
+  it's visible the day it ships. Only the 6 deliberately-late shipments (2
+  per day on March 29, 30, and 31, generated with `arrival_date =
+  shipment_date + 7 days`) are ever invisible to a cutoff on or before their
+  shipment date.
 
 Concretely, with this generated data:
 
 | Cutoff (`--as-of`) | shipments visible for March 29 | March 30 | March 31 |
 |---|---|---|---|
-| `2026-03-31` | 5 of 10 | 3 of 10 | 0 of 10 |
+| `2026-03-31` | 8 of 10 | 8 of 10 | 8 of 10 |
 | `2026-04-07` | 10 of 10 | 10 of 10 | 10 of 10 |
 
-At a March 31 cutoff, March 31's own shipments show up as **0** — nothing
-shipped that day has arrived yet by the cutoff, even shipments with a normal
-1-day transit time. That's not a bug; it's what "as of March 31" means. Verify
-it yourself:
+At a March 31 cutoff, each of those three days is missing exactly its 2
+deliberately-late shipments — 900 total unique shipments minus those 6 gives
+**894** unique shipments available across the whole quarter. That's not a
+bug; it's what "as of March 31" means. Verify it yourself:
 
 ```bash
 python3 pipeline.py backfill --start 2026-01-01 --end 2026-03-31 --as-of 2026-03-31
-python3 inspect_results.py    # shows the 5 / 3 / 0 breakdown above
+python3 inspect_results.py    # shows the 8 / 8 / 8 breakdown above, 894 total unique
 ```
 
 ## Determinism: what must match, and what's allowed to change
@@ -229,14 +237,27 @@ is appended to `work/run_log.csv` (never overwritten). Columns: `run_id`,
 
 A full review against append-only behavior, missing date filters, unstable
 CSV ordering, late-arrival filtering, stale shared-table checkpoints, and
-post-failure execution turned up one real bug (since fixed): a task's
-checkpoint was keyed by `(task, date, as_of)`, but its physical storage was
-keyed only by `(task, date)` — so revisiting a date under an older `--as-of`,
-after a newer one had overwritten that same partition, would report
-`skipped` and silently serve the newer cutoff's data. Fixed by adding
-`pipeline_partition_scope`, which tracks which `as_of` is currently resident
-in each physical partition; a checkpoint is only honored if that matches too.
-`verify.py` includes a regression test for exactly this scenario. Full
-details, evidence, and the one non-bug finding (the checklist's assumed
-"894 unique shipments at cutoff March 31" doesn't match this data's transit
-times — the correct figure is 878) are in that review's original write-up.
+post-failure execution turned up two real issues — one in the pipeline, one
+in the generator — both since fixed:
+
+1. **Stale shared-partition checkpoint (pipeline bug).** A task's checkpoint
+   was keyed by `(task, date, as_of)`, but its physical storage was keyed
+   only by `(task, date)` — so revisiting a date under an older `--as-of`,
+   after a newer one had overwritten that same partition, would report
+   `skipped` and silently serve the newer cutoff's data. Fixed by adding
+   `pipeline_partition_scope`, which tracks which `as_of` is currently
+   resident in each physical partition; a checkpoint is only honored if that
+   matches too. `verify.py` has a regression test for this.
+2. **`arrival_date` conflated physical transit time with billing
+   availability (generator bug).** An earlier revision of `generate_data.py`
+   computed `arrival_date` from each lane's 1–3 day standard transit time for
+   *every* shipment, not just the 6 deliberately-late ones. That let ordinary
+   shipments from the last few days of the quarter cross a same-day cutoff
+   too, so a March 31 cutoff showed 878 unique shipments instead of the
+   intended 894 (900 minus only the 6 late ones). `pipeline.py`'s filter
+   (`arrival_date <= as_of`) was correct throughout — the bug was in what
+   `arrival_date` meant, not in how it was filtered. Fixed by making
+   `arrival_date` equal `shipment_date` for every ordinary shipment; only the
+   6 late ones get `shipment_date + 7 days`. `generate_data.py`'s own
+   verification block now asserts this directly ("exactly 6 unique shipments
+   arrive after 2026-03-31").

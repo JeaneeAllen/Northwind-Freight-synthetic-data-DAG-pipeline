@@ -3,6 +3,13 @@
 
 Deterministic: every value is derived from the calendar date and a shipment's
 position within its day, so re-running produces byte-identical CSVs.
+
+arrival_date means "when the freight bill becomes available for billing," not
+physical delivery: for an ordinary shipment it equals shipment_date, so a
+same-day --as-of cutoff sees it immediately. Only the 6 deliberately-late
+shipments (2/day on Mar 29-31) get arrival_date = shipment_date + 7 days, so
+they're the only ones a Mar 31 cutoff excludes. standard_transit_days on each
+lane is descriptive metadata only; it does not feed arrival_date.
 """
 
 import csv
@@ -78,7 +85,7 @@ def build_shipments(fuel_rate_by_date):
             if day in LATE_BILL_DATES and seq in LATE_BILL_SEQS:
                 transit_days = LATE_TRANSIT_DAYS
             else:
-                transit_days = lane["standard_transit_days"]
+                transit_days = 0  # ordinary bill: available the day it ships
 
             freight_charge_cents = lane["distance_miles"] * lane["rate_cents_per_mile"]
             fuel_surcharge_cents = lane["distance_miles"] * fuel_rate
@@ -117,6 +124,11 @@ def verify(lanes, fuel_rates, shipments):
         if (date.fromisoformat(row["arrival_date"]) - date.fromisoformat(row["shipment_date"])).days
         == LATE_TRANSIT_DAYS
     )
+    unique_late_arrivals = {
+        row["shipment_id"]
+        for row in shipments
+        if date.fromisoformat(row["arrival_date"]) > END_DATE
+    }
 
     checks = [
         ("90 dates in fuel.csv", len(dates) == 90),
@@ -124,6 +136,7 @@ def verify(lanes, fuel_rates, shipments):
         ("900 unique shipment IDs", len(shipment_ids) == 900),
         ("909 shipment rows", len(shipments) == 909),
         ("6 late bills (7-day transit)", late_bills == 6),
+        (f"exactly 6 unique shipments arrive after {END_DATE.isoformat()}", len(unique_late_arrivals) == 6),
     ]
 
     print("\nVerification:")
