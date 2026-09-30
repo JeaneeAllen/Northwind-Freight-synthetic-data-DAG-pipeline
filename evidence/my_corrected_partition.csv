@@ -1,0 +1,4 @@
+shipment_date,lane_id,shipment_count,revenue_cents,cost_cents,margin_cents
+2026-03-31,LANE-1,4,554604,461352,93252
+2026-03-31,LANE-2,3,732600,616050,116550
+2026-03-31,LANE-3,3,611226,511434,99792
